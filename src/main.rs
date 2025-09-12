@@ -3,6 +3,8 @@ use std::io::{self, Write};
 use std::mem;
 use std::process;
 
+const MAX_NAME_LEN: usize = 32;
+const MAX_DESCRIPTION_LEN: usize = 256;
 const PAGE_SIZE: usize = 4096;
 const MAX_TABLE_PAGES: usize = 64;
 
@@ -11,10 +13,11 @@ struct Table {
     pages: [Option<Vec<Row>>; MAX_TABLE_PAGES],
 }
 
+// should hold 896 items
 struct Row {
     id: u32,
-    name: [u8; 32],
-    description: [u8; 256],
+    name: [u8; MAX_NAME_LEN],
+    description: [u8; MAX_DESCRIPTION_LEN],
 }
 
 impl Table {
@@ -26,6 +29,7 @@ impl Table {
     }
 
     fn insert(&mut self, args: &[&str]) -> Result<(), Box<dyn Error>> {
+        // TODO: parse ""
         if args.len() != 3 {
             return Err("syntax error: insert <id> <name> <description>".into());
         }
@@ -33,7 +37,13 @@ impl Table {
             .parse::<u32>()
             .map_err(|_| "syntax error: insert <id> <name> <description>")?;
         let name = args[1];
+        if name.len() > MAX_NAME_LEN {
+            return Err("name too long".into());
+        }
         let description = args[2];
+        if description.len() > MAX_DESCRIPTION_LEN {
+            return Err("description too long".into());
+        }
         let rows_per_page = PAGE_SIZE / mem::size_of::<Row>();
         let total_rows = rows_per_page * MAX_TABLE_PAGES;
         if total_rows == self.row_count as usize {
