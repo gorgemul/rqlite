@@ -1,45 +1,67 @@
+PROG="rqlite"
+DB="test.db"
 NAME_LEN_MAX=32
 DESCRIPTION_LEN_MAX=256
 ROW_MAX=896
 SUCCESS_TEST_COUNT=0
 FAIL_TEST_COUNT=0
 
-function exec_command() {
-  commands=("$@")
-  output=$(printf "%s\n" "${commands[@]}" | ./rqlite)
-  echo "$output"
-}
-
 function setup() {
-  cargo build || "build fail"
-  cp ../target/debug/rqlite .
+  cargo build || { echo "ERROR: build fail"; exit 1; }
+  cp "../target/debug/$PROG" .
 }
 
 function teardown() {
-  rm rqlite
+  rm "$PROG"
   rm -r ../target/debug
+}
+
+function exec_command() {
+  local commands=("$@")
+  local output=$(printf "%s\n" "${commands[@]}" | "./$PROG" "$DB")
+  echo "$output"
+}
+
+function summary_test() {
+  TEST_STATUS=$([[ "$FAIL_TEST_COUNT" -eq 0 ]] && echo "success" || echo "fail")
+  echo "TEST RESULT: $TEST_STATUS. $SUCCESS_TEST_COUNT passed. $FAIL_TEST_COUNT failed."
+}
+
+# since state persist even after exist, need to make a clean db for test
+function assert_and_drop_db() {
+  # assert
+  local got="$1"
+  local expected="$2"
+  local test_name="$3"
+  if [[ "$got" == "$expected" ]]; then
+    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
+    echo "SUCCESS: $test_name test pass"
+  else
+    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
+    echo "ERROR: $test_name test fail"
+    echo "=========== expected ==========="
+    echo "$expected"
+    echo "===========   got    ==========="
+    echo "$got"
+  fi
+  # drop db
+  if [[ -f "$DB" ]]; then
+    rm "$DB"
+  fi
 }
 
 function test_insert_one() {
   local commands=(
-    "insert 1 john goodstuent"
+    "insert 1 foo bar"
     "select"
     ".exit"
   )
   local got=$(exec_command "${commands[@]}")
   local expected="rqlite> success!
-rqlite> 1. john goodstuent
+rqlite> 1. foo bar
 success!
 rqlite> "
-  if [[ "$got" == "$expected" ]]; then
-    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
-    echo "SUCCESS: insert_one pass"
-  else
-    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
-    echo "ERROR: insert_one fail"
-    echo "expected: $expected"
-    echo "got: $got"
-  fi
+  assert_and_drop_db "$got" "$expected" "insert_one"
 }
 
 function test_insert_pass_max() {
@@ -47,6 +69,7 @@ function test_insert_pass_max() {
   for i in $(seq 1 $((ROW_MAX + 1))); do
     commands+=("insert $i name$i description$i")
   done
+  commands+=(".exit")
   local result=$(exec_command "${commands[@]}")
   # hack for split string into array by new line
   local save_IFS=$IFS
@@ -55,18 +78,21 @@ function test_insert_pass_max() {
   IFS="$save_IFS"
   got="${result_arr[${#result_arr[@]}-2]}" # get second to the last item
   expected="rqlite> table reach max size"
-  if [[ "$got" == "$expected" ]]; then
-    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
-    echo "SUCCESS: insert_pass_max pass"
-  else
-    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
-    echo "ERROR: insert_pass_max fail"
-    echo "expected: $expected"
-    echo "got: $got"
-  fi
+  assert_and_drop_db "$got" "$expected" "insert_pass_max"
 }
 
-function test_name_and_description_len_max() {
+function test_negative_id() {
+  local commands=(
+    "insert -1 foo bar"
+    ".exit"
+  )
+  local got=$(exec_command "${commands[@]}")
+  local expected="rqlite> id must be greater than 0
+rqlite> "
+  assert_and_drop_db "$got" "$expected" "negative_id"
+}
+
+function test_name_and_description_max_len() {
   local name=""
   local description=""
   for _ in $(seq 1 $NAME_LEN_MAX); do
@@ -85,15 +111,7 @@ function test_name_and_description_len_max() {
 rqlite> 1. $name $description
 success!
 rqlite> "
-  if [[ "$got" == "$expected" ]]; then
-    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
-    echo "SUCCESS: full_len_name_and_description pass"
-  else
-    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
-    echo "ERROR: full_len_name_and_description fail"
-    echo "expected: $expected"
-    echo "got: $got"
-  fi
+  assert_and_drop_db "$got" "$expected" "name_and_description_max_len"
 }
 
 function test_name_len_pass_max() {
@@ -108,15 +126,7 @@ function test_name_len_pass_max() {
   local got=$(exec_command "${commands[@]}")
   local expected="rqlite> name too long
 rqlite> "
-  if [[ "$got" == "$expected" ]]; then
-    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
-    echo "SUCCESS: name_len_pass_max pass"
-  else
-    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
-    echo "ERROR: name_len_pass_max fail"
-    echo "expected: $expected"
-    echo "got: $got"
-  fi
+  assert_and_drop_db "$got" "$expected" "name_len_pass_max"
 }
 
 function test_description_pass_max() {
@@ -131,23 +141,33 @@ function test_description_pass_max() {
   local got=$(exec_command "${commands[@]}")
   local expected="rqlite> description too long
 rqlite> "
-  if [[ "$got" == "$expected" ]]; then
-    SUCCESS_TEST_COUNT=$(($SUCCESS_TEST_COUNT + 1))
-    echo "SUCCESS: description_pass_max pass"
-  else
-    FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
-    echo "ERROR: description_pass_max fail"
-    echo "expected: $expected"
-    echo "got: $got"
-  fi
+  assert_and_drop_db "$got" "$expected" "description_pass_max"
+}
+
+function test_persistence() {
+  local commands1=(
+    "insert 1 foo bar"
+    ".exit"
+  )
+  local commands2=(
+    "select"
+    ".exit"
+  )
+  exec_command "${commands1[@]}" > /dev/null # for side effect
+  got=$(exec_command "${commands2[@]}")
+  local expected="rqlite> 1. foo bar
+success!
+rqlite> "
+  assert_and_drop_db "$got" "$expected" "persistence"
 }
 
 setup
 test_insert_one
 test_insert_pass_max
-test_name_and_description_len_max
+test_negative_id
+test_name_and_description_max_len
 test_name_len_pass_max
 test_description_pass_max
-TEST_STATUS=$([[ "$FAIL_TEST_COUNT" -eq 0 ]] && echo "success" || echo "fail")
-echo "TEST RESULT: $TEST_STATUS. $SUCCESS_TEST_COUNT passed. $FAIL_TEST_COUNT failed."
+test_persistence
+summary_test
 teardown
