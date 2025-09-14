@@ -1,11 +1,11 @@
+use std::env;
 use std::error::Error;
+use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufReader, SeekFrom};
 use std::mem;
-use std::process;
-use std::env;
-use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::process;
 
 const PAGE_SIZE: usize = 4096;
 const NAME_MAX_LEN: usize = 32;
@@ -86,9 +86,6 @@ impl Table {
         }
         for page_index in 0..n_pages {
             let page = self.pager.get_page(page_index).unwrap();
-            if page.is_empty() {
-                break;
-            }
             for row in page {
                 println!(
                     "{}. {} {}",
@@ -119,7 +116,7 @@ impl Pager {
             .read(true)
             .append(true)
             .open(path)?;
-        Ok(Pager{
+        Ok(Pager {
             file,
             pages: [const { None }; PAGE_MAX_LEN],
         })
@@ -139,8 +136,7 @@ impl Pager {
             let offset = (page_index * PAGE_SIZE) as u64;
             self.file.seek(SeekFrom::Start(offset))?;
             let mut reader = BufReader::new(&mut self.file);
-            let mut n_read: usize = 0;
-            while n_read < ROWS_PER_PAGE {
+            for _ in 0..ROWS_PER_PAGE {
                 let mut id_buf = [0u8; 4];
                 let mut name_buf = [0u8; NAME_MAX_LEN];
                 let mut description_buf = [0u8; DESCRIPTION_MAX_LEN];
@@ -148,11 +144,15 @@ impl Pager {
                 let id = i32::from_le_bytes(id_buf);
                 reader.read_exact(&mut name_buf)?;
                 reader.read_exact(&mut description_buf)?;
-                new_page.push(Row { id, name: name_buf, description: description_buf });
-                n_read += 1;
+                new_page.push(Row {
+                    id,
+                    name: name_buf,
+                    description: description_buf,
+                });
             }
         }
-        if page_index == n_pages && file_len % PAGE_SIZE != 0 { // right before last page append some rows don't have whole page size
+        if page_index == n_pages && file_len % PAGE_SIZE != 0 {
+            // right before last page append some rows don't have whole page size
             let offset = (page_index * PAGE_SIZE) as u64;
             self.file.seek(SeekFrom::Start(offset))?;
             let mut reader = BufReader::new(&mut self.file);
@@ -165,7 +165,11 @@ impl Pager {
                 let id = i32::from_le_bytes(id_buf);
                 reader.read_exact(&mut name_buf)?;
                 reader.read_exact(&mut description_buf)?;
-                new_page.push(Row { id, name: name_buf, description: description_buf });
+                new_page.push(Row {
+                    id,
+                    name: name_buf,
+                    description: description_buf,
+                });
             }
         }
         self.pages[page_index] = Some(new_page);
@@ -178,15 +182,13 @@ impl Pager {
         }
         let page_offset = page_index * PAGE_SIZE;
         let page = self.pages[page_index].as_ref().unwrap();
-        let mut n_rows: usize = 0;
-        for row in page {
-            let mut offset = (page_offset + n_rows * ROW_SIZE) as u64;
+        for (i, row) in page.iter().enumerate() {
+            let mut offset = (page_offset + i * ROW_SIZE) as u64;
             self.file.write_at(&row.id.to_le_bytes(), offset)?;
             offset += 4;
             self.file.write_at(&row.name, offset)?;
             offset += NAME_MAX_LEN as u64;
             self.file.write_at(&row.description, offset)?;
-            n_rows += 1;
         }
         let has_extra_rows = page.len() != ROWS_PER_PAGE; // only happen in last page
         if !has_extra_rows {
