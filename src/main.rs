@@ -1,8 +1,8 @@
 use std::env;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::io::prelude::*;
-use std::io::{self, BufReader, SeekFrom};
 use std::mem;
 use std::os::unix::fs::FileExt;
 use std::process;
@@ -15,19 +15,26 @@ const ROW_SIZE: usize = mem::size_of::<Row>();
 const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
 
 struct Table {
-    row_count: usize,
+    n_rows: usize,
     pager: Pager,
 }
 
 struct Pager {
     file: File,
-    pages: [Option<Vec<Row>>; PAGE_MAX_LEN],
+    pages: [Option<Vec<Option<Row>>>; PAGE_MAX_LEN],
 }
 
+#[derive(Clone)]
 struct Row {
     id: i32,
     name: [u8; NAME_MAX_LEN],
     description: [u8; DESCRIPTION_MAX_LEN],
+}
+
+struct Cursor<'a> {
+    table: &'a mut Table,
+    row_num: usize,        // not index, index is row_num - 1
+    pointing_to_end: bool, // when row_num == table.n_rows
 }
 
 impl Table {
@@ -36,7 +43,7 @@ impl Table {
         let n_pages = file_len / PAGE_SIZE;
         let extra_len = file_len % PAGE_SIZE; // could be extra rows
         Table {
-            row_count: (n_pages * ROWS_PER_PAGE) + (extra_len / ROW_SIZE),
+            n_rows: (n_pages * ROWS_PER_PAGE) + (extra_len / ROW_SIZE),
             pager,
         }
     }
@@ -62,38 +69,26 @@ impl Table {
         }
         let mut name_buf = [0u8; NAME_MAX_LEN];
         let mut description_buf = [0u8; DESCRIPTION_MAX_LEN];
-        let ceiling = name.len().min(NAME_MAX_LEN);
-        name_buf[0..ceiling].copy_from_slice(&name.as_bytes()[0..ceiling]);
-        let ceiling = description.len().min(DESCRIPTION_MAX_LEN);
-        description_buf[0..ceiling].copy_from_slice(&description.as_bytes()[0..ceiling]);
-        let new_row = Row {
+        let max = name.len().min(NAME_MAX_LEN);
+        name_buf[0..max].copy_from_slice(&name.as_bytes()[0..max]);
+        let max = description.len().min(DESCRIPTION_MAX_LEN);
+        description_buf[0..max].copy_from_slice(&description.as_bytes()[0..max]);
+        Cursor::from_end(self).write(Row {
             id,
             name: name_buf,
             description: description_buf,
-        };
-        let page_index = self.row_count / ROWS_PER_PAGE;
-        self.pager.get_page(page_index)?.push(new_row);
-        self.row_count += 1;
+        })?;
+        self.n_rows += 1;
         Ok(())
     }
 
-    // actually don't need &mut here, but for the sake of compiler complain,
-    // or just wrote two get_page method, one for &mut and the other for &
     fn select(&mut self) {
-        let mut n_pages = self.row_count / ROWS_PER_PAGE;
-        if self.row_count % ROWS_PER_PAGE != 0 {
-            n_pages += 1;
-        }
-        for page_index in 0..n_pages {
-            let page = self.pager.get_page(page_index).unwrap();
-            for row in page {
-                println!(
-                    "{}. {} {}",
-                    row.id,
-                    str::from_utf8(&row.name).unwrap(),
-                    str::from_utf8(&row.description).unwrap()
-                )
+        let mut cursor = Cursor::from_start(self);
+        while !cursor.pointing_to_end {
+            if let Some(row) = cursor.read().unwrap() {
+                row.print();
             }
+            cursor.advance();
         }
     }
 }
@@ -101,7 +96,8 @@ impl Table {
 impl Drop for Table {
     fn drop(&mut self) {
         for page_index in 0..PAGE_MAX_LEN {
-            if let Err(error) = self.pager.flush_page(page_index) {
+            let is_last_page = (page_index + 1) * ROWS_PER_PAGE >= self.n_rows; // TODO: better solution?
+            if let Err(error) = self.pager.flush_page(page_index, is_last_page) {
                 eprintln!("ERROR: db close {error}");
                 process::exit(1);
             }
@@ -122,7 +118,7 @@ impl Pager {
         })
     }
 
-    fn get_page(&mut self, page_index: usize) -> Result<&mut Vec<Row>, Box<dyn Error>> {
+    fn get_page(&mut self, page_index: usize) -> Result<&mut Vec<Option<Row>>, Box<dyn Error>> {
         if page_index >= PAGE_MAX_LEN {
             return Err("table reach max size".into());
         }
@@ -131,72 +127,129 @@ impl Pager {
         if self.pages[page_index].is_some() {
             return Ok(self.pages[page_index].as_mut().unwrap());
         }
-        let mut new_page = Vec::new();
+        let mut new_page = vec![None; ROWS_PER_PAGE];
+        let page_offset = page_index * PAGE_SIZE;
         if page_index < n_pages {
-            let offset = (page_index * PAGE_SIZE) as u64;
-            self.file.seek(SeekFrom::Start(offset))?;
-            let mut reader = BufReader::new(&mut self.file);
-            for _ in 0..ROWS_PER_PAGE {
-                let mut id_buf = [0u8; 4];
-                let mut name_buf = [0u8; NAME_MAX_LEN];
-                let mut description_buf = [0u8; DESCRIPTION_MAX_LEN];
-                reader.read_exact(&mut id_buf)?;
-                let id = i32::from_le_bytes(id_buf);
-                reader.read_exact(&mut name_buf)?;
-                reader.read_exact(&mut description_buf)?;
-                new_page.push(Row {
-                    id,
-                    name: name_buf,
-                    description: description_buf,
-                });
+            for (i, row) in new_page.iter_mut().enumerate().take(ROWS_PER_PAGE) {
+                let offset = (page_offset + i * ROW_SIZE) as u64;
+                *row = Some(Row::read_at(&self.file, offset)?);
             }
         }
         if page_index == n_pages && file_len % PAGE_SIZE != 0 {
             // right before last page append some rows don't have whole page size
-            let offset = (page_index * PAGE_SIZE) as u64;
-            self.file.seek(SeekFrom::Start(offset))?;
-            let mut reader = BufReader::new(&mut self.file);
-            let n_rows = (file_len % PAGE_SIZE) / ROW_SIZE;
-            for _ in 0..n_rows {
-                let mut id_buf = [0u8; 4];
-                let mut name_buf = [0u8; NAME_MAX_LEN];
-                let mut description_buf = [0u8; DESCRIPTION_MAX_LEN];
-                reader.read_exact(&mut id_buf)?;
-                let id = i32::from_le_bytes(id_buf);
-                reader.read_exact(&mut name_buf)?;
-                reader.read_exact(&mut description_buf)?;
-                new_page.push(Row {
-                    id,
-                    name: name_buf,
-                    description: description_buf,
-                });
+            let n_extra_rows = (file_len % PAGE_SIZE) / ROW_SIZE;
+            for (i, row) in new_page.iter_mut().enumerate().take(n_extra_rows) {
+                let offset = (page_offset + i * ROW_SIZE) as u64;
+                *row = Some(Row::read_at(&self.file, offset)?);
             }
         }
         self.pages[page_index] = Some(new_page);
         Ok(self.pages[page_index].as_mut().unwrap())
     }
 
-    fn flush_page(&mut self, page_index: usize) -> Result<(), io::Error> {
+    fn flush_page(&mut self, page_index: usize, is_last_page: bool) -> Result<(), io::Error> {
         if self.pages[page_index].is_none() {
             return Ok(());
         }
         let page_offset = page_index * PAGE_SIZE;
         let page = self.pages[page_index].as_ref().unwrap();
-        for (i, row) in page.iter().enumerate() {
-            let mut offset = (page_offset + i * ROW_SIZE) as u64;
-            self.file.write_at(&row.id.to_le_bytes(), offset)?;
-            offset += 4;
-            self.file.write_at(&row.name, offset)?;
-            offset += NAME_MAX_LEN as u64;
-            self.file.write_at(&row.description, offset)?;
+        for (i, row_option) in page.iter().enumerate() {
+            if let Some(row) = row_option {
+                let offset = (page_offset + i * ROW_SIZE) as u64;
+                row.write_at(&mut self.file, offset)?;
+            }
         }
-        let has_extra_rows = page.len() != ROWS_PER_PAGE; // only happen in last page
-        if !has_extra_rows {
+        if !is_last_page {
             let offset = (page_offset + ROWS_PER_PAGE * ROW_SIZE) as u64;
             let padding = vec![0u8; PAGE_SIZE - ROWS_PER_PAGE * ROW_SIZE];
             self.file.write_at(&padding, offset)?;
         }
         self.file.flush()?;
+        Ok(())
+    }
+}
+
+impl Row {
+    fn read_at(file: &File, mut offset: u64) -> Result<Self, io::Error> {
+        let mut id_buf = [0u8; 4];
+        let mut name = [0u8; NAME_MAX_LEN];
+        let mut description = [0u8; DESCRIPTION_MAX_LEN];
+        file.read_at(&mut id_buf, offset)?;
+        offset += 4;
+        file.read_at(&mut name, offset)?;
+        offset += NAME_MAX_LEN as u64;
+        file.read_at(&mut description, offset)?;
+        let id = i32::from_le_bytes(id_buf);
+        Ok(Row {
+            id,
+            name,
+            description,
+        })
+    }
+
+    fn write_at(&self, file: &mut File, mut offset: u64) -> Result<(), io::Error> {
+        file.write_at(&self.id.to_le_bytes(), offset)?;
+        offset += 4;
+        file.write_at(&self.name, offset)?;
+        offset += NAME_MAX_LEN as u64;
+        file.write_at(&self.description, offset)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    fn print(&self) {
+        println!(
+            "{}. {} {}",
+            self.id,
+            str::from_utf8(&self.name).unwrap(),
+            str::from_utf8(&self.description).unwrap()
+        )
+    }
+}
+
+impl<'a> Cursor<'a> {
+    fn from_start(table: &'a mut Table) -> Self {
+        let pointing_to_end = table.n_rows == 0; // since table is &mut, need to get n_rows before table assingment
+        Cursor {
+            table,
+            row_num: 0,
+            pointing_to_end,
+        }
+    }
+
+    fn from_end(table: &'a mut Table) -> Self {
+        let row_num = table.n_rows;
+        Cursor {
+            table,
+            row_num,
+            pointing_to_end: true,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.row_num += 1;
+        if self.row_num == self.table.n_rows {
+            self.pointing_to_end = true;
+        }
+    }
+
+    // actually don't need &mut here, but for the sake of compiler complain,
+    // or just wrote two get_page method, one for &mut and the other for &
+    fn read(&mut self) -> Result<Option<&Row>, Box<dyn Error>> {
+        let page_index = self.row_num / ROWS_PER_PAGE;
+        let row_index = self.row_num % ROWS_PER_PAGE;
+        let page = self.table.pager.get_page(page_index)?;
+        match page[row_index] {
+            None => Ok(None),
+            Some(_) => Ok(page[row_index].as_ref()),
+        }
+    }
+
+    fn write(&mut self, row: Row) -> Result<(), Box<dyn Error>> {
+        let page_index = self.row_num / ROWS_PER_PAGE;
+        let row_index = self.row_num % ROWS_PER_PAGE;
+        let page = self.table.pager.get_page(page_index)?;
+        page[row_index] = Some(row);
         Ok(())
     }
 }

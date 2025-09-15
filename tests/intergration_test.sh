@@ -8,6 +8,7 @@ FAIL_TEST_COUNT=0
 
 function setup() {
   cargo build || { echo "ERROR: build fail"; exit 1; }
+  rm "$DB" > /dev/null
   cp "../target/debug/$PROG" .
 }
 
@@ -45,9 +46,7 @@ function assert_and_drop_db() {
     echo "$got"
   fi
   # drop db
-  if [[ -f "$DB" ]]; then
-    rm "$DB"
-  fi
+  rm "$DB" > /dev/null
 }
 
 function test_insert_one() {
