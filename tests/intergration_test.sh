@@ -1,19 +1,25 @@
 PROG="rqlite"
 DB="test.db"
-NAME_LEN_MAX=32
-DESCRIPTION_LEN_MAX=256
-ROW_MAX=896
 SUCCESS_TEST_COUNT=0
 FAIL_TEST_COUNT=0
 
+PAGE_SIZE=4096
+PAGE_MAX_NUMS=64;
+ID_SIZE=8
+NAME_MAX_SIZE=32
+DESCRIPTION_MAX_SIZE=256
+ROW_SIZE=$(($ID_SIZE + $NAME_MAX_SIZE + $DESCRIPTION_MAX_SIZE))
+ROWS_PER_PAGE=$(($PAGE_SIZE / $ROW_SIZE))
+ROW_MAX=$(($PAGE_MAX_NUMS * $ROWS_PER_PAGE))
+
 function setup() {
   cargo build || { echo "ERROR: build fail"; exit 1; }
-  rm "$DB" > /dev/null
+  rm "$DB" > /dev/null 2>&1
   cp "../target/debug/$PROG" .
 }
 
 function teardown() {
-  rm "$PROG"
+  rm "$PROG" 
   rm -r ../target/debug
 }
 
@@ -46,7 +52,7 @@ function assert_and_drop_db() {
     echo "$got"
   fi
   # drop db
-  rm "$DB" > /dev/null
+  rm "$DB" > /dev/null 2>&1
 }
 
 function test_insert_one() {
@@ -94,10 +100,10 @@ rqlite> "
 function test_name_and_description_max_len() {
   local name=""
   local description=""
-  for _ in $(seq 1 $NAME_LEN_MAX); do
+  for _ in $(seq 1 $NAME_MAX_SIZE); do
     name+="n"
   done
-  for _ in $(seq 1 $DESCRIPTION_LEN_MAX); do
+  for _ in $(seq 1 $DESCRIPTION_MAX_SIZE); do
     description+="d"
   done
   local commands=(
@@ -115,7 +121,7 @@ rqlite> "
 
 function test_name_len_pass_max() {
   local name=""
-  for _ in $(seq 1 $(($NAME_LEN_MAX + 1))); do
+  for _ in $(seq 1 $(($NAME_MAX_SIZE + 1))); do
     name+="n"
   done
   local commands=(
@@ -130,7 +136,7 @@ rqlite> "
 
 function test_description_pass_max() {
   local description=""
-  for _ in $(seq 1 $((DESCRIPTION_LEN_MAX + 1)));do
+  for _ in $(seq 1 $((DESCRIPTION_MAX_SIZE + 1)));do
     description+="d"
   done
   local commands=(
