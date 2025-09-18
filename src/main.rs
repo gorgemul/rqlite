@@ -13,19 +13,37 @@ const NAME_MAX_SIZE: usize = 32;
 const DESCRIPTION_MAX_SIZE: usize = 256;
 const PAGE_MAX_NUMS: usize = 64;
 const ROW_SIZE: usize = mem::size_of::<Row>();
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROW_SIZE;
+
+const NODE_KIND_SIZE: usize = size_of::<NodeKind>();
+const NODE_IS_ROOT_SIZE: usize = size_of::<bool>();
+const NODE_PARENT_SIZE: usize = size_of::<i32>();
+const INTERNAL_NODE_HEADER_SIZE: usize = NODE_KIND_SIZE + NODE_IS_ROOT_SIZE + NODE_PARENT_SIZE;
+const LEAF_NODE_N_CELLS_SIZE: usize = size_of::<u16>();
+const LEAF_NODE_HEADER_SIZE: usize = INTERNAL_NODE_HEADER_SIZE + LEAF_NODE_N_CELLS_SIZE;
+const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const LEAF_NODE_CELL_KEY_SIZE: usize = size_of::<i64>();
+const LEAF_NODE_CELL_VALUE_SIZE: usize = ROW_SIZE;
+const LEAF_NODE_CELL_SIZE: usize = size_of::<Cell>();
+const LEAF_NODE_CELLS_PER_LEAF_NODE: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+// make sure always one byte in size
+#[repr(u8)]
+enum NodeKind {
+    Internal = 1,
+    Leaf = 2,
+}
 
 struct Table {
-    n_rows: usize,
+    root_node_index: usize,
     pager: Pager,
 }
 
 struct Pager {
     file: File,
-    pages: [Option<Vec<Option<Row>>>; PAGE_MAX_NUMS],
+    n_pages: usize,
+    pages: [Option<Node>; PAGE_MAX_NUMS],
 }
 
-#[derive(Clone)]
 struct Row {
     id: i64,
     name: [u8; NAME_MAX_SIZE],
@@ -34,17 +52,38 @@ struct Row {
 
 struct Cursor<'a> {
     table: &'a mut Table,
-    row_index: usize,      // point to the index of last unused row
-    pointing_to_end: bool, // when row_index == table.n_rows
+    page_index: usize,
+    cell_index: usize,
+    end_of_table: bool,
+}
+
+struct Cell {
+    key: i64,
+    value: Row,
+}
+
+struct Node {
+    kind: NodeKind,
+    is_root: bool,
+    parent: i32,
+    // following fields only exist in leaf node
+    n_cells: Option<u16>,
+    cells: Option<[Option<Cell>; LEAF_NODE_CELLS_PER_LEAF_NODE]>,
 }
 
 impl Table {
-    fn new(pager: Pager) -> Self {
-        let file_len = pager.file.metadata().unwrap().len() as usize;
-        let n_pages = file_len / PAGE_SIZE;
-        let extra_rows = file_len % PAGE_SIZE; // could be extra rows
+    fn new(mut pager: Pager) -> Self {
+        let root_node_index = 0usize;
+        if pager.n_pages == 0 {
+            let root_node = pager.get_page(root_node_index).unwrap();
+            root_node.kind = NodeKind::Leaf;
+            root_node.is_root = true;
+            root_node.parent = -1; // no parent
+            root_node.n_cells = Some(0);
+            root_node.cells = Some([const { None }; LEAF_NODE_CELLS_PER_LEAF_NODE]);
+        }
         Table {
-            n_rows: (n_pages * ROWS_PER_PAGE) + (extra_rows / ROW_SIZE),
+            root_node_index,
             pager,
         }
     }
@@ -74,20 +113,27 @@ impl Table {
         name_buf[0..max].copy_from_slice(&name.as_bytes()[0..max]);
         let max = description.len().min(DESCRIPTION_MAX_SIZE);
         description_buf[0..max].copy_from_slice(&description.as_bytes()[0..max]);
-        Cursor::from_end(self).write(Row {
-            id,
-            name: name_buf,
-            description: description_buf,
+        Cursor::from_end(self).write(Cell {
+            key: id,
+            value: Row {
+                id,
+                name: name_buf,
+                description: description_buf,
+            },
         })?;
-        self.n_rows += 1;
         Ok(())
     }
 
     fn select(&mut self) {
         let mut cursor = Cursor::from_start(self);
-        while !cursor.pointing_to_end {
-            if let Some(row) = cursor.read().unwrap() {
-                row.print();
+        while !cursor.end_of_table {
+            if let Some(cell) = cursor.read().unwrap() {
+                println!(
+                    "{}. {} {}",
+                    cell.value.id,
+                    str::from_utf8(&cell.value.name).unwrap(),
+                    str::from_utf8(&cell.value.description).unwrap()
+                )
             }
             cursor.advance();
         }
@@ -96,9 +142,8 @@ impl Table {
 
 impl Drop for Table {
     fn drop(&mut self) {
-        for page_index in 0..PAGE_MAX_NUMS {
-            let is_last_page = (page_index + 1) * ROWS_PER_PAGE >= self.n_rows; // TODO: better solution?
-            if let Err(error) = self.pager.flush_page(page_index, is_last_page) {
+        for page_index in 0..self.pager.n_pages {
+            if let Err(error) = self.pager.flush_page(page_index) {
                 eprintln!("ERROR: db close {error}");
                 process::exit(1);
             }
@@ -107,152 +152,247 @@ impl Drop for Table {
 }
 
 impl Pager {
-    fn new(path: &str) -> Result<Self, io::Error> {
+    fn new(path: &str) -> Result<Self, Box<dyn Error>> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(path)?;
+        let file_size = file.metadata()?.len() as usize;
+        if file_size % PAGE_SIZE != 0 {
+            return Err("ERROR: invalid database file, should be page-aligned".into());
+        }
         Ok(Pager {
             file,
+            n_pages: file_size / PAGE_SIZE,
             pages: [const { None }; PAGE_MAX_NUMS],
         })
     }
 
-    fn get_page(&mut self, page_index: usize) -> Result<&mut Vec<Option<Row>>, Box<dyn Error>> {
+    fn get_page(&mut self, page_index: usize) -> Result<&mut Node, Box<dyn Error>> {
         if page_index >= PAGE_MAX_NUMS {
             return Err("table reach max size".into());
         }
         if self.pages[page_index].is_some() {
             return Ok(self.pages[page_index].as_mut().unwrap());
         }
-        let file_len = self.file.metadata()?.len() as usize;
-        let n_pages = file_len / PAGE_SIZE;
-        let mut new_page = vec![None; ROWS_PER_PAGE];
-        let page_offset = page_index * PAGE_SIZE;
-        if page_index < n_pages {
-            for (i, row) in new_page.iter_mut().enumerate().take(ROWS_PER_PAGE) {
-                let offset = (page_offset + i * ROW_SIZE) as u64;
-                *row = Some(Row::read_at(&self.file, offset)?);
-            }
+        if page_index < self.n_pages {
+            self.pages[page_index] =
+                Some(Node::read_at(&self.file, page_index_to_offset(page_index))?);
+        } else {
+            self.n_pages = page_index + 1;
+            self.pages[page_index] = Some(Node {
+                kind: NodeKind::Internal,
+                is_root: false,
+                parent: -1,
+                n_cells: None,
+                cells: None,
+            });
         }
-        if page_index == n_pages && file_len % PAGE_SIZE != 0 {
-            // right before last page append some rows don't have whole page size
-            let n_extra_rows = (file_len % PAGE_SIZE) / ROW_SIZE;
-            for (i, row) in new_page.iter_mut().enumerate().take(n_extra_rows) {
-                let offset = (page_offset + i * ROW_SIZE) as u64;
-                *row = Some(Row::read_at(&self.file, offset)?);
-            }
-        }
-        self.pages[page_index] = Some(new_page);
         Ok(self.pages[page_index].as_mut().unwrap())
     }
 
-    fn flush_page(&mut self, page_index: usize, is_last_page: bool) -> Result<(), io::Error> {
-        if self.pages[page_index].is_none() {
-            return Ok(());
+    fn flush_page(&mut self, page_index: usize) -> Result<(), Box<dyn Error>> {
+        match self.pages[page_index].as_mut() {
+            None => Ok(()),
+            Some(page) => Ok(page.write_at(&self.file, page_index_to_offset(page_index))?),
         }
-        let page_offset = page_index * PAGE_SIZE;
-        let page = self.pages[page_index].as_ref().unwrap();
-        for (i, row_option) in page.iter().enumerate() {
-            if let Some(row) = row_option {
-                let offset = (page_offset + i * ROW_SIZE) as u64;
-                row.write_at(&mut self.file, offset)?;
-            }
-        }
-        if !is_last_page {
-            let offset = (page_offset + ROWS_PER_PAGE * ROW_SIZE) as u64;
-            let padding = vec![0u8; PAGE_SIZE - ROWS_PER_PAGE * ROW_SIZE];
-            self.file.write_at(&padding, offset)?;
-        }
-        self.file.flush()?;
-        Ok(())
-    }
-}
-
-impl Row {
-    fn read_at(file: &File, mut offset: u64) -> Result<Self, io::Error> {
-        let mut id_buf = [0u8; ID_SIZE];
-        let mut name = [0u8; NAME_MAX_SIZE];
-        let mut description = [0u8; DESCRIPTION_MAX_SIZE];
-        file.read_at(&mut id_buf, offset)?;
-        offset += ID_SIZE as u64;
-        file.read_at(&mut name, offset)?;
-        offset += NAME_MAX_SIZE as u64;
-        file.read_at(&mut description, offset)?;
-        let id = i64::from_le_bytes(id_buf);
-        Ok(Row {
-            id,
-            name,
-            description,
-        })
-    }
-
-    fn write_at(&self, file: &mut File, mut offset: u64) -> Result<(), io::Error> {
-        file.write_at(&self.id.to_le_bytes(), offset)?;
-        offset += ID_SIZE as u64;
-        file.write_at(&self.name, offset)?;
-        offset += NAME_MAX_SIZE as u64;
-        file.write_at(&self.description, offset)?;
-        file.flush()?;
-        Ok(())
-    }
-
-    fn print(&self) {
-        println!(
-            "{}. {} {}",
-            self.id,
-            str::from_utf8(&self.name).unwrap(),
-            str::from_utf8(&self.description).unwrap()
-        )
     }
 }
 
 impl<'a> Cursor<'a> {
     fn from_start(table: &'a mut Table) -> Self {
-        let pointing_to_end = table.n_rows == 0; // since table is &mut, need to get n_rows before table assingment
+        let page_index = table.root_node_index; // since table is &mut, need to get n_rows before table assingment
+        let root_node = table.pager.get_page(page_index).unwrap();
+        let end_of_table = root_node.get_n_cells() == 0;
         Cursor {
             table,
-            row_index: 0,
-            pointing_to_end,
+            page_index,
+            cell_index: 0,
+            end_of_table,
         }
     }
 
     fn from_end(table: &'a mut Table) -> Self {
-        let row_index = table.n_rows;
+        let page_index = table.root_node_index;
+        let root_node = table.pager.get_page(page_index).unwrap();
+        let cell_index = root_node.get_n_cells() as usize;
         Cursor {
             table,
-            row_index,
-            pointing_to_end: true,
+            page_index,
+            cell_index,
+            end_of_table: true,
         }
     }
 
     fn advance(&mut self) {
-        self.row_index += 1;
-        if self.row_index == self.table.n_rows {
-            self.pointing_to_end = true;
+        self.cell_index += 1;
+        let current_node = self.table.pager.get_page(self.page_index).unwrap();
+        if self.cell_index >= current_node.get_n_cells().into() {
+            self.end_of_table = true;
         }
     }
 
     // actually don't need &mut here, but for the sake of compiler complain,
     // or just wrote two get_page method, one for &mut and the other for &
-    fn read(&mut self) -> Result<Option<&Row>, Box<dyn Error>> {
-        let page_index = self.row_index / ROWS_PER_PAGE;
-        let row_index = self.row_index % ROWS_PER_PAGE;
-        let page = self.table.pager.get_page(page_index)?;
-        match page[row_index] {
-            None => Ok(None),
-            Some(_) => Ok(page[row_index].as_ref()),
-        }
+    fn read(&mut self) -> Result<Option<&Cell>, Box<dyn Error>> {
+        Ok(self
+            .table
+            .pager
+            .get_page(self.page_index)?
+            .read_cell(self.cell_index))
     }
 
-    fn write(&mut self, row: Row) -> Result<(), Box<dyn Error>> {
-        let page_index = self.row_index / ROWS_PER_PAGE;
-        let row_index = self.row_index % ROWS_PER_PAGE;
-        let page = self.table.pager.get_page(page_index)?;
-        page[row_index] = Some(row);
+    fn write(&mut self, cell: Cell) -> Result<(), Box<dyn Error>> {
+        self.table
+            .pager
+            .get_page(self.page_index)?
+            .insert_cell(self.cell_index, cell)?;
         Ok(())
     }
+}
+
+impl NodeKind {
+    fn from_u8(v: u8) -> Result<Self, Box<dyn Error>> {
+        match v {
+            1 => Ok(Self::Internal),
+            2 => Ok(Self::Leaf),
+            _ => Err("unkown value {v}, can't transform valid node kind".into()),
+        }
+    }
+    fn to_u8(&self) -> u8 {
+        match self {
+            Self::Internal => 1,
+            Self::Leaf => 2,
+        }
+    }
+}
+
+impl Node {
+    fn get_n_cells(&self) -> u16 {
+        self.n_cells
+            .expect("ERROR: get_n_cells must be called by leaf node")
+    }
+    fn get_mut_cells(&mut self) -> &mut [Option<Cell>] {
+        self.cells
+            .as_mut()
+            .map(|arr| arr.as_mut_slice())
+            .expect("ERROR: get_mut_cells must be called by leaf node")
+    }
+    fn read_at(file: &File, mut offset: u64) -> Result<Self, Box<dyn Error>> {
+        let mut kind_buf = [0u8; NODE_KIND_SIZE];
+        let mut is_root_buf = [0u8; NODE_IS_ROOT_SIZE];
+        let mut parent_buf = [0u8; NODE_PARENT_SIZE];
+        file.read_at(&mut kind_buf, offset)?;
+        offset += NODE_KIND_SIZE as u64;
+        let kind = NodeKind::from_u8(u8::from_le_bytes(kind_buf))?;
+        file.read_at(&mut is_root_buf, offset)?;
+        offset += NODE_IS_ROOT_SIZE as u64;
+        let is_root = u8::from_le_bytes(is_root_buf) != 0;
+        file.read_at(&mut parent_buf, offset)?;
+        offset += NODE_PARENT_SIZE as u64;
+        let parent = i32::from_le_bytes(parent_buf);
+        let mut new_node = Node {
+            kind,
+            is_root,
+            parent,
+            n_cells: None,
+            cells: None,
+        };
+        if let NodeKind::Internal = new_node.kind {
+            return Ok(new_node);
+        }
+        let mut n_cells_buf = [0u8; LEAF_NODE_N_CELLS_SIZE];
+        file.read_at(&mut n_cells_buf, offset)?;
+        offset += LEAF_NODE_N_CELLS_SIZE as u64;
+        let n_cells = u16::from_le_bytes(n_cells_buf);
+        new_node.n_cells = Some(n_cells);
+        new_node.cells = Some([const { None }; LEAF_NODE_CELLS_PER_LEAF_NODE]);
+        let n_cells = new_node.get_n_cells();
+        for cell in new_node.get_mut_cells().iter_mut().take(n_cells.into()) {
+            let mut cell_key_buf = [0u8; LEAF_NODE_CELL_KEY_SIZE];
+            file.read_at(&mut cell_key_buf, offset)?;
+            offset += LEAF_NODE_CELL_KEY_SIZE as u64;
+            let mut id_buf = [0u8; ID_SIZE];
+            let mut name = [0u8; NAME_MAX_SIZE];
+            let mut description = [0u8; DESCRIPTION_MAX_SIZE];
+            file.read_at(&mut id_buf, offset)?;
+            offset += ID_SIZE as u64;
+            file.read_at(&mut name, offset)?;
+            offset += NAME_MAX_SIZE as u64;
+            file.read_at(&mut description, offset)?;
+            offset += LEAF_NODE_CELL_VALUE_SIZE as u64;
+            let id = i64::from_le_bytes(id_buf);
+            let cell_key = i64::from_le_bytes(cell_key_buf);
+            *cell = Some(Cell {
+                key: cell_key,
+                value: Row {
+                    id,
+                    name,
+                    description,
+                },
+            });
+        }
+        Ok(new_node)
+    }
+    fn write_at(&mut self, mut file: &File, mut offset: u64) -> Result<(), Box<dyn Error>> {
+        let start = offset;
+        let kind = self.kind.to_u8();
+        let is_root = self.is_root as u8;
+        file.write_at(&kind.to_le_bytes(), offset)?;
+        offset += NODE_KIND_SIZE as u64;
+        file.write_at(&is_root.to_le_bytes(), offset)?;
+        offset += NODE_IS_ROOT_SIZE as u64;
+        file.write_at(&self.parent.to_le_bytes(), offset)?;
+        offset += NODE_PARENT_SIZE as u64;
+        if let NodeKind::Internal = self.kind {
+            let advance_size = (offset - start) as usize;
+            let padding = vec![0u8; PAGE_SIZE - advance_size];
+            file.write_at(&padding, offset)?;
+            file.flush()?;
+            return Ok(());
+        }
+        let n_cells = self.get_n_cells();
+        file.write_at(&n_cells.to_le_bytes(), offset)?;
+        offset += LEAF_NODE_N_CELLS_SIZE as u64;
+        for cell in self.get_mut_cells().iter().take(n_cells.into()).flatten() {
+            file.write_at(&cell.key.to_le_bytes(), offset)?;
+            offset += LEAF_NODE_CELL_KEY_SIZE as u64;
+            file.write_at(&cell.value.id.to_le_bytes(), offset)?;
+            offset += ID_SIZE as u64;
+            file.write_at(&cell.value.name, offset)?;
+            offset += NAME_MAX_SIZE as u64;
+            file.write_at(&cell.value.description, offset)?;
+            offset += DESCRIPTION_MAX_SIZE as u64;
+        }
+        let advance_size = (offset - start) as usize;
+        let padding = vec![0u8; PAGE_SIZE - advance_size];
+        file.write_at(&padding, offset)?;
+        file.flush()?;
+        Ok(())
+    }
+    fn read_cell(&self, cell_index: usize) -> Option<&Cell> {
+        self.cells.as_ref()?.get(cell_index)?.as_ref()
+    }
+    fn insert_cell(&mut self, cell_index: usize, cell: Cell) -> Result<(), Box<dyn Error>> {
+        let n_cells = self.get_n_cells();
+        if cell_index >= LEAF_NODE_CELLS_PER_LEAF_NODE {
+            return Err("table reach max size".into()); // TODO: need to split page
+        }
+        let mut i = n_cells as usize;
+        let cells = self.get_mut_cells();
+        while cell_index < i {
+            cells[i] = cells[i - 1].take();
+            i -= 1;
+        }
+        cells[cell_index] = Some(cell);
+        self.n_cells = Some(n_cells + 1);
+        Ok(())
+    }
+}
+
+fn page_index_to_offset(page_index: usize) -> u64 {
+    (page_index * PAGE_SIZE) as u64
 }
 
 fn main() {
