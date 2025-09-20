@@ -1,5 +1,6 @@
 PROG="rqlite"
 DB="test.db"
+PROMPT="rqlite>"
 SUCCESS_TEST_COUNT=0
 FAIL_TEST_COUNT=0
 
@@ -15,7 +16,7 @@ INTERNAL_NODE_HEADER_SIZE=6
 LEAF_NODE_HEADER_SIZE=8
 LEAF_NODE_CELL_SIZE=$(($ROW_SIZE + $ID_SIZE))
 LEAF_NODE_SPACE_FOR_CELLS=$(($PAGE_SIZE - $LEAF_NODE_HEADER_SIZE))
-LEAF_NODE_CELLS_PER_LEAF_NODE=$(($LEAF_NODE_SPACE_FOR_CELLS / $LEAF_NODE_CELL_SIZE))
+LEAF_NODE_CELL_MAX_NUM=$(($LEAF_NODE_SPACE_FOR_CELLS / $LEAF_NODE_CELL_SIZE))
 
 function setup() {
   cargo build || { echo "ERROR: build fail"; exit 1; }
@@ -51,10 +52,12 @@ function assert_and_drop_db() {
   else
     FAIL_TEST_COUNT=$(($FAIL_TEST_COUNT + 1))
     echo "ERROR: $test_name test fail"
-    echo "=========== expected ==========="
+    echo "=========== *expected ==========="
     echo "$expected"
-    echo "===========   got    ==========="
+    echo "=========== expected* ==========="
+    echo "===========   *got    ==========="
     echo "$got"
+    echo "===========   got*    ==========="
   fi
   # drop db
   rm "$DB" > /dev/null 2>&1
@@ -67,11 +70,48 @@ function test_insert_one() {
     ".exit"
   )
   local got=$(exec_command "${commands[@]}")
-  local expected="rqlite> success!
-rqlite> 1. foo bar
-success!
-rqlite> "
+  local expected="$PROMPT executed.
+$PROMPT [1, foo, bar]
+executed.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "insert_one"
+}
+
+function test_insert_less_args() {
+  local commands=(
+    "insert foo bar"
+    ".exit"
+  )
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT ERROR: insert <id> <name> <description>.
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "insert_less_args"
+}
+
+function test_insert_not_num_id() {
+  local commands=(
+    "insert foo bar baz"
+    ".exit"
+  )
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT ERROR: insert <id> <name> <description>.
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "insert_not_num_id"
+}
+
+function test_insert_duplicated_id() {
+  local commands=(
+    "insert 1 foo1 bar1"
+    "insert 2 foo2 bar2"
+    "insert 1 foo bar"
+    ".exit"
+  )
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT executed.
+$PROMPT executed.
+$PROMPT ERROR: key '1' already exist.
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "insert_duplicated_id"
 }
 
 function test_insert_pass_max() {
@@ -87,8 +127,34 @@ function test_insert_pass_max() {
   local result_arr=($result)
   IFS="$save_IFS"
   got="${result_arr[${#result_arr[@]}-2]}" # get second to the last item
-  expected="rqlite> table reach max size"
+  expected="$PROMPT ERROR: table reach max size."
   assert_and_drop_db "$got" "$expected" "insert_pass_max"
+}
+
+function test_insert_out_of_order() {
+  local commands=(
+    "insert 100 foo100 bar100"
+    "insert 50 foo50 bar50"
+    "insert 75 foo75 bar75"
+    "insert 2 foo2 bar2"
+    "insert 120 foo120 bar120"
+    "select"
+    ".exit"
+  )
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT [2, foo2, bar2]
+[50, foo50, bar50]
+[75, foo75, bar75]
+[100, foo100, bar100]
+[120, foo120, bar120]
+executed.
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "insert_out_of_order"
 }
 
 function test_negative_id() {
@@ -97,8 +163,8 @@ function test_negative_id() {
     ".exit"
   )
   local got=$(exec_command "${commands[@]}")
-  local expected="rqlite> id must be greater than 0
-rqlite> "
+  local expected="$PROMPT ERROR: id must be greater than 0.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "negative_id"
 }
 
@@ -117,10 +183,10 @@ function test_name_and_description_max_len() {
     ".exit"
 )
   local got=$(exec_command "${commands[@]}")
-  local expected="rqlite> success!
-rqlite> 1. $name $description
-success!
-rqlite> "
+  local expected="$PROMPT executed.
+$PROMPT [1, $name, $description]
+executed.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "name_and_description_max_len"
 }
 
@@ -134,8 +200,8 @@ function test_name_len_pass_max() {
     ".exit"
 )
   local got=$(exec_command "${commands[@]}")
-  local expected="rqlite> name too long
-rqlite> "
+  local expected="$PROMPT ERROR: name too long.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "name_len_pass_max"
 }
 
@@ -149,8 +215,8 @@ function test_description_pass_max() {
     ".exit"
 )
   local got=$(exec_command "${commands[@]}")
-  local expected="rqlite> description too long
-rqlite> "
+  local expected="$PROMPT ERROR: description too long.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "description_pass_max"
 }
 
@@ -164,10 +230,10 @@ function test_persistence() {
     ".exit"
   )
   exec_command "${commands1[@]}" > /dev/null # for side effect
-  got=$(exec_command "${commands2[@]}")
-  local expected="rqlite> 1. foo bar
-success!
-rqlite> "
+  local got=$(exec_command "${commands2[@]}")
+  local expected="$PROMPT [1, foo, bar]
+executed.
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "persistence"
 }
 
@@ -176,20 +242,24 @@ function test_print_constants() {
     ".constants"
     ".exit"
   )
-  got=$(exec_command "${commands[@]}")
-  local expected="rqlite> row size: $ROW_SIZE
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT row size: $ROW_SIZE
 internal node header size: $INTERNAL_NODE_HEADER_SIZE
 leaf node header size: $LEAF_NODE_HEADER_SIZE
 leaf node cell size: $LEAF_NODE_CELL_SIZE
 leaf node space for cells: $LEAF_NODE_SPACE_FOR_CELLS
-leaf node max cells: $LEAF_NODE_CELLS_PER_LEAF_NODE
-rqlite> "
+leaf node max cells: $LEAF_NODE_CELL_MAX_NUM
+$PROMPT "
   assert_and_drop_db "$got" "$expected" "print_constants"
 }
 
 setup
+test_insert_less_args
+test_insert_not_num_id
+test_insert_duplicated_id
 test_insert_one
 test_insert_pass_max
+test_insert_out_of_order
 test_negative_id
 test_name_and_description_max_len
 test_name_len_pass_max
