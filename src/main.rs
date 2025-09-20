@@ -22,8 +22,8 @@ const INTERNAL_NODE_HEADER_SIZE: usize = NODE_KIND_SIZE + NODE_IS_ROOT_SIZE + NO
 const LEAF_NODE_N_CELLS_SIZE: usize = size_of::<u16>();
 const LEAF_NODE_HEADER_SIZE: usize = INTERNAL_NODE_HEADER_SIZE + LEAF_NODE_N_CELLS_SIZE;
 const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const LEAF_NODE_CELL_KEY_SIZE: usize = size_of::<i64>();
 const LEAF_NODE_CELL_SIZE: usize = size_of::<Cell>();
+const LEAF_NODE_CELL_KEY_SIZE: usize = size_of::<i64>();
 const LEAF_NODE_CELLS_PER_LEAF_NODE: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
 // make sure always one byte in size
@@ -159,7 +159,7 @@ impl Pager {
             .append(true)
             .open(path)?;
         let file_size = file.metadata()?.len() as usize;
-        if file_size % PAGE_SIZE != 0 {
+        if !file_size.is_multiple_of(PAGE_SIZE) {
             return Err("ERROR: invalid database file, should be page-aligned".into());
         }
         Ok(Pager {
@@ -350,9 +350,9 @@ impl Node {
             NODE_PARENT_SIZE,
         )?;
         if let NodeKind::Internal = self.kind {
-            let advance_distance = offset - start;
-            let padding = vec![0u8; PAGE_SIZE - advance_distance];
-            write_and_advance(file, &padding, &mut offset, advance_distance)?;
+            let padding_len = PAGE_SIZE - (offset - start);
+            let padding = vec![0u8; padding_len];
+            write_and_advance(file, &padding, &mut offset, padding_len)?;
             file.flush()?;
             return Ok(());
         }
@@ -379,9 +379,9 @@ impl Node {
                 DESCRIPTION_MAX_SIZE,
             )?;
         }
-        let advance_distance = offset - start;
-        let padding = vec![0u8; PAGE_SIZE - advance_distance];
-        write_and_advance(file, &padding, &mut offset, advance_distance)?;
+        let padding_len = PAGE_SIZE - (offset - start);
+        let padding = vec![0u8; padding_len];
+        write_and_advance(file, &padding, &mut offset, padding_len)?;
         file.flush()?;
         Ok(())
     }
@@ -457,6 +457,14 @@ fn main() {
             // exec metacommand
             match input {
                 ".exit" => break,
+                ".constants" => {
+                    println!("row size: {}", size_of::<Row>());
+                    println!("internal node header size: {INTERNAL_NODE_HEADER_SIZE}");
+                    println!("leaf node header size: {LEAF_NODE_HEADER_SIZE}");
+                    println!("leaf node cell size: {LEAF_NODE_CELL_SIZE}");
+                    println!("leaf node space for cells: {LEAF_NODE_SPACE_FOR_CELLS}");
+                    println!("leaf node max cells: {LEAF_NODE_CELLS_PER_LEAF_NODE}");
+                }
                 _ => println!("error: unknown command: '{input}'"),
             }
         } else {
