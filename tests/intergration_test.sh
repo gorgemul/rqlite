@@ -12,10 +12,9 @@ DESCRIPTION_MAX_SIZE=256
 ROW_SIZE=$(($ID_SIZE + $NAME_MAX_SIZE + $DESCRIPTION_MAX_SIZE))
 ROWS_PER_PAGE=$(($PAGE_SIZE / $ROW_SIZE))
 ROW_MAX=$(($PAGE_MAX_NUMS * $ROWS_PER_PAGE))
-INTERNAL_NODE_HEADER_SIZE=6
-LEAF_NODE_HEADER_SIZE=8
+NODE_HEADER_SIZE=10
 LEAF_NODE_CELL_SIZE=$(($ROW_SIZE + $ID_SIZE))
-LEAF_NODE_SPACE_FOR_CELLS=$(($PAGE_SIZE - $LEAF_NODE_HEADER_SIZE))
+LEAF_NODE_SPACE_FOR_CELLS=$(($PAGE_SIZE - $NODE_HEADER_SIZE))
 LEAF_NODE_CELL_MAX_NUM=$(($LEAF_NODE_SPACE_FOR_CELLS / $LEAF_NODE_CELL_SIZE))
 
 function setup() {
@@ -31,7 +30,7 @@ function teardown() {
 
 function exec_command() {
   local commands=("$@")
-  local output=$(printf "%s\n" "${commands[@]}" | "./$PROG" "$DB")
+  local output=$(printf "%s\n" "${commands[@]}" | "./$PROG" "$DB" 2>&1)
   echo "$output"
 }
 
@@ -243,14 +242,59 @@ function test_print_constants() {
     ".exit"
   )
   local got=$(exec_command "${commands[@]}")
-  local expected="$PROMPT row size: $ROW_SIZE
-internal node header size: $INTERNAL_NODE_HEADER_SIZE
-leaf node header size: $LEAF_NODE_HEADER_SIZE
+  local expected="$PROMPT CONSTANT:
+row size: $ROW_SIZE
+node header size: $NODE_HEADER_SIZE
+leaf node header size: $NODE_HEADER_SIZE
 leaf node cell size: $LEAF_NODE_CELL_SIZE
 leaf node space for cells: $LEAF_NODE_SPACE_FOR_CELLS
 leaf node max cells: $LEAF_NODE_CELL_MAX_NUM
 $PROMPT "
   assert_and_drop_db "$got" "$expected" "print_constants"
+}
+
+function test_print_tree() {
+  local commands=()
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 1))); do
+    commands+=("insert $i name$i description$i")
+  done
+  commands+=(".tree")
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT TREE:
+- internal (size 1)
+  - leaf (size 7)
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+  - key 7
+  - leaf (size 7)
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "print_tree"
 }
 
 setup
@@ -266,5 +310,6 @@ test_name_len_pass_max
 test_description_pass_max
 test_persistence
 test_print_constants
+test_print_tree
 summary_test
 teardown

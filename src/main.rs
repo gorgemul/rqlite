@@ -7,24 +7,38 @@ use std::mem;
 use std::os::unix::fs::FileExt;
 use std::process;
 
-const NO_PARENT: i32 = -1;
+const NOT_EXIST: i32 = -1;
 
 const PAGE_SIZE: usize = 4096;
 const ID_SIZE: usize = mem::size_of::<i64>();
 const NAME_MAX_SIZE: usize = 32;
 const DESCRIPTION_MAX_SIZE: usize = 256;
-const PAGE_MAX_NUMS: usize = 64;
+const PAGE_MAX_NUM: usize = 64;
 
 const NODE_KIND_SIZE: usize = size_of::<NodeKind>();
 const NODE_IS_ROOT_SIZE: usize = size_of::<bool>();
 const NODE_PARENT_SIZE: usize = size_of::<i32>();
-const INTERNAL_NODE_HEADER_SIZE: usize = NODE_KIND_SIZE + NODE_IS_ROOT_SIZE + NODE_PARENT_SIZE;
-const LEAF_NODE_N_CELLS_SIZE: usize = size_of::<u16>();
-const LEAF_NODE_HEADER_SIZE: usize = INTERNAL_NODE_HEADER_SIZE + LEAF_NODE_N_CELLS_SIZE;
+const NODE_N_CELLS_SIZE: usize = size_of::<u32>();
+const NODE_HEADER_SIZE: usize =
+    NODE_KIND_SIZE + NODE_IS_ROOT_SIZE + NODE_PARENT_SIZE + NODE_N_CELLS_SIZE;
+
+const LEAF_NODE_HEADER_SIZE: usize = NODE_HEADER_SIZE;
 const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const LEAF_NODE_CELL_SIZE: usize = size_of::<Cell>();
 const LEAF_NODE_CELL_KEY_SIZE: usize = size_of::<i64>();
+const LEAF_NODE_CELL_SIZE: usize =
+    LEAF_NODE_CELL_KEY_SIZE + ID_SIZE + NAME_MAX_SIZE + DESCRIPTION_MAX_SIZE;
 const LEAF_NODE_CELL_MAX_NUM: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+const INTERNAL_NODE_RIGHT_CHILD_SIZE: usize = size_of::<i32>();
+const INTERNAL_NODE_HEADER_SIZE: usize = NODE_HEADER_SIZE + INTERNAL_NODE_RIGHT_CHILD_SIZE;
+const INTERNAL_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - INTERNAL_NODE_HEADER_SIZE;
+const INTERNAL_NODE_CELL_KEY_SIZE: usize = size_of::<i64>();
+const INTERNAL_NODE_CELL_CHILD_SIZE: usize = size_of::<i32>();
+const INTERNAL_NODE_CELL_SIZE: usize = INTERNAL_NODE_CELL_KEY_SIZE + INTERNAL_NODE_CELL_CHILD_SIZE;
+const INTERNAL_NODE_CELL_MAX_NUM: usize = INTERNAL_NODE_SPACE_FOR_CELLS / INTERNAL_NODE_CELL_SIZE;
+
+const SPLIT_RIGHT_LEAF_NODE_NUM: usize = (LEAF_NODE_CELL_MAX_NUM + 1) / 2;
+const SPLIT_LEFT_LEAF_NODE_NUM: usize = (LEAF_NODE_CELL_MAX_NUM + 1) - SPLIT_RIGHT_LEAF_NODE_NUM;
 
 const ERR_INSERT_SYNTAX: &str = "ERROR: insert <id> <name> <description>.";
 const ERR_NOT_POSITIVE_ID: &str = "ERROR: id must be greater than 0.";
@@ -47,9 +61,10 @@ struct Table {
 struct Pager {
     file: File,
     n_pages: usize,
-    pages: [Option<Node>; PAGE_MAX_NUMS],
+    pages: [Option<Node>; PAGE_MAX_NUM],
 }
 
+#[derive(Clone)]
 struct Row {
     id: i64,
     name: [u8; NAME_MAX_SIZE],
@@ -63,18 +78,27 @@ struct Cursor<'a> {
     end_of_table: bool,
 }
 
-struct Cell {
+#[derive(Clone)]
+struct LeafCell {
     key: i64,
     value: Row,
+}
+
+struct InternalCell {
+    key: i64,
+    child: i32,
 }
 
 struct Node {
     kind: NodeKind,
     is_root: bool,
     parent: i32,
+    n_cells: u32,
     // following fields only exist in leaf node
-    n_cells: Option<u16>,
-    cells: Option<[Option<Cell>; LEAF_NODE_CELL_MAX_NUM]>,
+    leaf_cells: Option<[Option<LeafCell>; LEAF_NODE_CELL_MAX_NUM]>,
+    // following fields only exist in internal node
+    right_child: Option<i32>,
+    internal_cells: Option<[Option<InternalCell>; INTERNAL_NODE_CELL_MAX_NUM]>,
 }
 
 impl Table {
@@ -82,11 +106,8 @@ impl Table {
         let root_node_index = 0usize;
         if pager.n_pages == 0 {
             let root_node = pager.get_page(root_node_index).unwrap();
-            root_node.kind = NodeKind::Leaf;
+            root_node.become_leaf_node();
             root_node.is_root = true;
-            root_node.parent = NO_PARENT;
-            root_node.n_cells = Some(0);
-            root_node.cells = Some([const { None }; LEAF_NODE_CELL_MAX_NUM]);
         }
         Table {
             root_node_index,
@@ -99,10 +120,7 @@ impl Table {
         if args.len() != 3 {
             return Err(ERR_INSERT_SYNTAX.into());
         }
-        let n_cells = self.pager.get_page(self.root_node_index)?.get_n_cells() as usize;
-        if n_cells >= LEAF_NODE_CELL_MAX_NUM {
-            return Err(ERR_TABLE_FULL.into());
-        }
+        let n_cells = self.pager.get_page(self.root_node_index)?.get_n_cells();
         let id = args[0].parse::<i64>().map_err(|_| ERR_INSERT_SYNTAX)?;
         if id <= 0 {
             return Err(ERR_NOT_POSITIVE_ID.into());
@@ -122,10 +140,10 @@ impl Table {
         let max = description.len().min(DESCRIPTION_MAX_SIZE);
         description_buf[0..max].copy_from_slice(&description.as_bytes()[0..max]);
         let mut cursor = Cursor::from(self, id);
-        if cursor.cell_index < n_cells && id == cursor.read()?.unwrap().key {
+        if cursor.cell_index < n_cells && id == cursor.read_leaf_cell()?.unwrap().key {
             return Err(format!("ERROR: key '{id}' already exist.").into());
         }
-        cursor.write(Cell {
+        cursor.write_leaf_cell(LeafCell {
             key: id,
             value: Row {
                 id,
@@ -139,7 +157,7 @@ impl Table {
     fn select(&mut self) {
         let mut cursor = Cursor::from_start(self);
         while !cursor.end_of_table {
-            if let Some(cell) = cursor.read().unwrap() {
+            if let Some(cell) = cursor.read_leaf_cell().unwrap() {
                 println!(
                     "[{}, {}, {}]",
                     cell.value.id,
@@ -177,12 +195,68 @@ impl Pager {
         Ok(Pager {
             file,
             n_pages: file_size / PAGE_SIZE,
-            pages: [const { None }; PAGE_MAX_NUMS],
+            pages: [const { None }; PAGE_MAX_NUM],
         })
     }
 
+    fn print_tree(&self, page_index: usize, indentation: usize) {
+        match self.pages[page_index].as_ref() {
+            None => println!("tree node {page_index} not exist"),
+            Some(node) => match node.kind {
+                NodeKind::Leaf => {
+                    let n_cells = node.get_n_cells();
+                    print_with_indentation(
+                        indentation,
+                        format!("- leaf (size {n_cells})").as_ref(),
+                    );
+                    for i in 0..n_cells {
+                        let leaf_cell = node.read_leaf_cell(i).unwrap();
+                        print_with_indentation(
+                            indentation + 1,
+                            format!("- {}", leaf_cell.key).as_ref(),
+                        );
+                    }
+                }
+                NodeKind::Internal => {
+                    let n_cells = node.get_n_cells();
+                    print_with_indentation(
+                        indentation,
+                        format!("- internal (size {n_cells})").as_ref(),
+                    );
+                    for i in 0..n_cells {
+                        let internal_cell = node.read_internal_cell(i).unwrap();
+                        self.print_tree(internal_cell.child as usize, indentation + 1);
+                        print_with_indentation(
+                            indentation + 1,
+                            format!("- key {}", internal_cell.key).as_ref(),
+                        );
+                    }
+                    self.print_tree(node.right_child.unwrap() as usize, indentation + 1);
+                }
+            },
+        }
+    }
+
+    fn get_new_page_index(&self) -> usize {
+        self.n_pages
+    }
+
+    // must be called when two page exist
+    fn get_two_pages(
+        &mut self,
+        first_page_index: usize,
+        second_page_index: usize,
+    ) -> (&mut Node, &mut Node) {
+        let ptr = self.pages.as_mut_ptr();
+        unsafe {
+            let first_node = (*ptr.add(first_page_index)).as_mut().unwrap();
+            let second_node = (*ptr.add(second_page_index)).as_mut().unwrap();
+            (first_node, second_node)
+        }
+    }
+
     fn get_page(&mut self, page_index: usize) -> Result<&mut Node, Box<dyn Error>> {
-        if page_index >= PAGE_MAX_NUMS {
+        if page_index >= PAGE_MAX_NUM {
             return Err(ERR_TABLE_FULL.into());
         }
         if self.pages[page_index].is_some() {
@@ -193,11 +267,13 @@ impl Pager {
         } else {
             self.n_pages = page_index + 1;
             self.pages[page_index] = Some(Node {
-                kind: NodeKind::Internal,
+                kind: NodeKind::Leaf,
                 is_root: false,
-                parent: NO_PARENT,
-                n_cells: None,
-                cells: None,
+                parent: NOT_EXIST,
+                n_cells: 0,
+                leaf_cells: None,
+                right_child: None,
+                internal_cells: None,
             });
         }
         Ok(self.pages[page_index].as_mut().unwrap())
@@ -229,12 +305,12 @@ impl<'a> Cursor<'a> {
         let root_node = table.pager.get_page(page_index).unwrap();
         match root_node.kind {
             NodeKind::Leaf => {
-                let n_cells = root_node.get_n_cells() as usize;
+                let n_cells = root_node.get_n_cells();
                 let mut left = 0usize;
                 let mut right = n_cells;
                 while left != right {
                     let mid = (left + right) / 2;
-                    let cell_key = root_node.read_cell(mid).unwrap().key;
+                    let cell_key = root_node.read_leaf_cell(mid).unwrap().key;
                     if key == cell_key {
                         return Cursor {
                             table,
@@ -264,25 +340,89 @@ impl<'a> Cursor<'a> {
     fn advance(&mut self) {
         self.cell_index += 1;
         let current_node = self.table.pager.get_page(self.page_index).unwrap();
-        if self.cell_index >= current_node.get_n_cells().into() {
+        if self.cell_index >= current_node.get_n_cells() {
             self.end_of_table = true;
         }
     }
 
     // actually don't need &mut here, but for the sake of compiler's complain
-    fn read(&mut self) -> Result<Option<&Cell>, Box<dyn Error>> {
+    fn read_leaf_cell(&mut self) -> Result<Option<&LeafCell>, Box<dyn Error>> {
         Ok(self
             .table
             .pager
             .get_page(self.page_index)?
-            .read_cell(self.cell_index))
+            .read_leaf_cell(self.cell_index))
     }
 
-    fn write(&mut self, cell: Cell) -> Result<(), Box<dyn Error>> {
-        self.table
+    fn write_leaf_cell(&mut self, cell: LeafCell) -> Result<(), Box<dyn Error>> {
+        let node = self.table.pager.get_page(self.page_index)?;
+        if node.get_n_cells() < LEAF_NODE_CELL_MAX_NUM {
+            node.insert_leaf_cell(self.cell_index, cell);
+            return Ok(());
+        }
+        let new_page_index = self.table.pager.get_new_page_index();
+        let new_node = self.table.pager.get_page(new_page_index)?;
+        new_node.become_leaf_node();
+        let (old_node, new_node) = self
+            .table
             .pager
-            .get_page(self.page_index)?
-            .insert_cell(self.cell_index, cell);
+            .get_two_pages(self.page_index, new_page_index);
+        for i in (0..LEAF_NODE_CELL_MAX_NUM + 1).rev() {
+            let cell_index = i % SPLIT_LEFT_LEAF_NODE_NUM;
+            if i == self.cell_index {
+                if i >= SPLIT_LEFT_LEAF_NODE_NUM {
+                    new_node.put_leaf_cell(cell_index, cell.clone());
+                } else {
+                    old_node.put_leaf_cell(cell_index, cell.clone());
+                }
+            } else if i > self.cell_index {
+                let leaf_cells = old_node.get_mut_leaf_cells();
+                let old_cell = leaf_cells[i - 1].take().unwrap();
+                if i >= SPLIT_LEFT_LEAF_NODE_NUM {
+                    new_node.put_leaf_cell(cell_index, old_cell);
+                } else {
+                    old_node.put_leaf_cell(cell_index, old_cell);
+                }
+            } else {
+                let leaf_cells = old_node.get_mut_leaf_cells();
+                let old_cell = leaf_cells[i].take().unwrap();
+                if i >= SPLIT_LEFT_LEAF_NODE_NUM {
+                    new_node.put_leaf_cell(cell_index, old_cell);
+                } else {
+                    old_node.put_leaf_cell(cell_index, old_cell);
+                }
+            }
+        }
+        old_node.n_cells = SPLIT_LEFT_LEAF_NODE_NUM as u32;
+        new_node.n_cells = SPLIT_RIGHT_LEAF_NODE_NUM as u32;
+        if old_node.is_root {
+            new_node.parent = self.page_index as i32;
+            let left_child_page_index = self.table.pager.get_new_page_index();
+            let left_child = self.table.pager.get_page(left_child_page_index)?;
+            left_child.become_leaf_node();
+            let (root_node, left_child) = self
+                .table
+                .pager
+                .get_two_pages(self.page_index, left_child_page_index);
+            let n_cells = root_node.get_n_cells();
+            left_child.n_cells = n_cells as u32;
+            left_child.parent = self.page_index as i32;
+            let root_leaf_cells = root_node.get_mut_leaf_cells();
+            let left_child_leaf_cells = left_child.get_mut_leaf_cells();
+            for i in 0..n_cells {
+                left_child_leaf_cells[i] = Some(root_leaf_cells[i].take().unwrap());
+            }
+            root_node.become_internal_node();
+            root_node.n_cells = 1;
+            root_node.right_child = Some(new_page_index as i32);
+            let internal_cells = root_node.get_mut_internal_cells();
+            internal_cells[0] = Some(InternalCell {
+                key: left_child.get_max_key(),
+                child: left_child_page_index as i32,
+            });
+        } else {
+            panic!("update parent after split");
+        }
         Ok(())
     }
 }
@@ -304,43 +444,92 @@ impl NodeKind {
 }
 
 impl Node {
-    fn get_n_cells(&self) -> u16 {
-        self.n_cells
-            .expect("ERROR: get_n_cells must be called by leaf node.")
+    fn become_leaf_node(&mut self) {
+        self.kind = NodeKind::Leaf;
+        self.n_cells = 0;
+        self.leaf_cells = Some([const { None }; LEAF_NODE_CELL_MAX_NUM]);
+        self.right_child = None;
+        self.internal_cells = None;
     }
-    fn get_mut_cells(&mut self) -> &mut [Option<Cell>] {
-        self.cells
+    fn become_internal_node(&mut self) {
+        self.kind = NodeKind::Internal;
+        self.n_cells = 0;
+        self.leaf_cells = None;
+        self.right_child = Some(NOT_EXIST);
+        self.internal_cells = Some([const { None }; INTERNAL_NODE_CELL_MAX_NUM]);
+    }
+    fn get_n_cells(&self) -> usize {
+        self.n_cells as usize
+    }
+    fn get_mut_leaf_cells(&mut self) -> &mut [Option<LeafCell>] {
+        self.leaf_cells
             .as_mut()
             .map(|arr| arr.as_mut_slice())
-            .expect("ERROR: get_mut_cells must be called by leaf node.")
+            .expect("ERROR: get_mut_leaf_cells must be called by leaf node.")
+    }
+    fn get_mut_internal_cells(&mut self) -> &mut [Option<InternalCell>] {
+        self.internal_cells
+            .as_mut()
+            .map(|arr| arr.as_mut_slice())
+            .expect("ERROR: get_mut_internal_cells must be called by internal node.")
     }
     fn read_at(file: &File, mut offset: usize) -> Result<Self, Box<dyn Error>> {
         let mut kind_buf = [0u8; NODE_KIND_SIZE];
         let mut is_root_buf = [0u8; NODE_IS_ROOT_SIZE];
         let mut parent_buf = [0u8; NODE_PARENT_SIZE];
+        let mut n_cells_buf = [0u8; NODE_N_CELLS_SIZE];
         read_and_advance(file, &mut kind_buf, &mut offset, NODE_KIND_SIZE)?;
         read_and_advance(file, &mut is_root_buf, &mut offset, NODE_IS_ROOT_SIZE)?;
         read_and_advance(file, &mut parent_buf, &mut offset, NODE_PARENT_SIZE)?;
+        read_and_advance(file, &mut n_cells_buf, &mut offset, NODE_N_CELLS_SIZE)?;
         let mut new_node = Node {
             kind: NodeKind::from_u8(u8::from_le_bytes(kind_buf))?,
             is_root: u8::from_le_bytes(is_root_buf) != 0,
             parent: i32::from_le_bytes(parent_buf),
-            n_cells: None,
-            cells: None,
+            n_cells: u32::from_le_bytes(n_cells_buf),
+            leaf_cells: None,
+            right_child: None,
+            internal_cells: None,
         };
         if let NodeKind::Internal = new_node.kind {
-            return Ok(new_node);
-        }
-        let mut n_cells_buf = [0u8; LEAF_NODE_N_CELLS_SIZE];
-        read_and_advance(file, &mut n_cells_buf, &mut offset, LEAF_NODE_N_CELLS_SIZE)?;
-        new_node.n_cells = Some(u16::from_le_bytes(n_cells_buf));
-        new_node.cells = Some([const { None }; LEAF_NODE_CELL_MAX_NUM]);
-        let n_cells = new_node.get_n_cells();
-        for cell in new_node.get_mut_cells().iter_mut().take(n_cells.into()) {
-            let mut cell_key_buf = [0u8; LEAF_NODE_CELL_KEY_SIZE];
+            let mut right_child_buf = [0u8; INTERNAL_NODE_RIGHT_CHILD_SIZE];
             read_and_advance(
                 file,
-                &mut cell_key_buf,
+                &mut right_child_buf,
+                &mut offset,
+                INTERNAL_NODE_RIGHT_CHILD_SIZE,
+            )?;
+            new_node.right_child = Some(i32::from_le_bytes(right_child_buf));
+            let n_cells = new_node.get_n_cells();
+            for cell in new_node.get_mut_internal_cells().iter_mut().take(n_cells) {
+                let mut internal_cell_key_buf = [0u8; INTERNAL_NODE_CELL_KEY_SIZE];
+                let mut internal_cell_child_buf = [0u8; INTERNAL_NODE_CELL_CHILD_SIZE];
+                read_and_advance(
+                    file,
+                    &mut internal_cell_key_buf,
+                    &mut offset,
+                    INTERNAL_NODE_CELL_KEY_SIZE,
+                )?;
+                read_and_advance(
+                    file,
+                    &mut internal_cell_child_buf,
+                    &mut offset,
+                    INTERNAL_NODE_CELL_CHILD_SIZE,
+                )?;
+                *cell = Some(InternalCell {
+                    key: i64::from_le_bytes(internal_cell_key_buf),
+                    child: i32::from_le_bytes(internal_cell_child_buf),
+                });
+            }
+            return Ok(new_node);
+        }
+        new_node.leaf_cells = Some([const { None }; LEAF_NODE_CELL_MAX_NUM]);
+        let n_cells = new_node.get_n_cells();
+        for cell in new_node.get_mut_leaf_cells().iter_mut().take(n_cells) {
+            let mut leaf_cell_key_buf = [0u8; LEAF_NODE_CELL_KEY_SIZE];
+            read_and_advance(
+                file,
+                &mut leaf_cell_key_buf,
                 &mut offset,
                 LEAF_NODE_CELL_KEY_SIZE,
             )?;
@@ -355,8 +544,8 @@ impl Node {
                 &mut offset,
                 DESCRIPTION_MAX_SIZE,
             )?;
-            *cell = Some(Cell {
-                key: i64::from_le_bytes(cell_key_buf),
+            *cell = Some(LeafCell {
+                key: i64::from_le_bytes(leaf_cell_key_buf),
                 value: Row {
                     id: i64::from_le_bytes(id_buf),
                     name: name_buf,
@@ -386,21 +575,47 @@ impl Node {
             &mut offset,
             NODE_PARENT_SIZE,
         )?;
+        let n_cells = self.get_n_cells() as u32;
+        write_and_advance(file, &n_cells.to_le_bytes(), &mut offset, NODE_N_CELLS_SIZE)?;
         if let NodeKind::Internal = self.kind {
+            let right_child = self.right_child.unwrap();
+            write_and_advance(
+                file,
+                &right_child.to_le_bytes(),
+                &mut offset,
+                INTERNAL_NODE_RIGHT_CHILD_SIZE,
+            )?;
+            for cell in self
+                .get_mut_internal_cells()
+                .iter()
+                .take(n_cells as usize)
+                .flatten()
+            {
+                write_and_advance(
+                    file,
+                    &cell.key.to_le_bytes(),
+                    &mut offset,
+                    INTERNAL_NODE_CELL_KEY_SIZE,
+                )?;
+                write_and_advance(
+                    file,
+                    &cell.child.to_le_bytes(),
+                    &mut offset,
+                    INTERNAL_NODE_CELL_CHILD_SIZE,
+                )?;
+            }
             let padding_len = PAGE_SIZE - (offset - start);
             let padding = vec![0u8; padding_len];
             write_and_advance(file, &padding, &mut offset, padding_len)?;
             file.flush()?;
             return Ok(());
         }
-        let n_cells = self.get_n_cells();
-        write_and_advance(
-            file,
-            &n_cells.to_le_bytes(),
-            &mut offset,
-            LEAF_NODE_N_CELLS_SIZE,
-        )?;
-        for cell in self.get_mut_cells().iter().take(n_cells.into()).flatten() {
+        for cell in self
+            .get_mut_leaf_cells()
+            .iter()
+            .take(n_cells as usize)
+            .flatten()
+        {
             write_and_advance(
                 file,
                 &cell.key.to_le_bytes(),
@@ -422,22 +637,40 @@ impl Node {
         file.flush()?;
         Ok(())
     }
-    fn read_cell(&self, cell_index: usize) -> Option<&Cell> {
-        self.cells.as_ref()?.get(cell_index)?.as_ref()
+    fn read_leaf_cell(&self, cell_index: usize) -> Option<&LeafCell> {
+        self.leaf_cells.as_ref()?.get(cell_index)?.as_ref()
     }
-    fn insert_cell(&mut self, cell_index: usize, cell: Cell) {
+    fn read_internal_cell(&self, cell_index: usize) -> Option<&InternalCell> {
+        self.internal_cells.as_ref()?.get(cell_index)?.as_ref()
+    }
+    fn put_leaf_cell(&mut self, cell_index: usize, cell: LeafCell) {
+        let leaf_cells = self.leaf_cells.as_mut().unwrap();
+        leaf_cells[cell_index] = Some(cell);
+    }
+    fn insert_leaf_cell(&mut self, cell_index: usize, cell: LeafCell) {
         if cell_index >= LEAF_NODE_CELL_MAX_NUM {
             panic!("TODO: need to split page");
         }
         let n_cells = self.get_n_cells();
-        let mut i = n_cells as usize;
-        let cells = self.get_mut_cells();
+        let mut i = n_cells;
+        let leaf_cells = self.get_mut_leaf_cells();
         while cell_index < i {
-            cells[i] = cells[i - 1].take();
+            leaf_cells[i] = leaf_cells[i - 1].take();
             i -= 1;
         }
-        cells[cell_index] = Some(cell);
-        self.n_cells = Some(n_cells + 1);
+        leaf_cells[cell_index] = Some(cell);
+        self.n_cells = (n_cells as u32) + 1;
+    }
+    fn get_max_key(&self) -> i64 {
+        let index = self.get_n_cells() - 1;
+        match self.kind {
+            NodeKind::Leaf => {
+                self.read_leaf_cell(index).unwrap().key
+            }
+            NodeKind::Internal => {
+                self.read_internal_cell(index).unwrap().key
+            }
+        }
     }
 }
 
@@ -461,6 +694,10 @@ fn read_and_advance(
     file.read_at(buf, *offset as u64)?;
     *offset += advance_distance;
     Ok(())
+}
+
+fn print_with_indentation(indentation: usize, text: &str) {
+    println!("{indent}{text}", indent = " ".repeat(indentation * 2));
 }
 
 fn main() {
@@ -494,12 +731,17 @@ fn main() {
             match input {
                 ".exit" => break,
                 ".constants" => {
+                    println!("CONSTANT:");
                     println!("row size: {}", size_of::<Row>());
-                    println!("internal node header size: {INTERNAL_NODE_HEADER_SIZE}");
+                    println!("node header size: {NODE_HEADER_SIZE}");
                     println!("leaf node header size: {LEAF_NODE_HEADER_SIZE}");
                     println!("leaf node cell size: {LEAF_NODE_CELL_SIZE}");
                     println!("leaf node space for cells: {LEAF_NODE_SPACE_FOR_CELLS}");
                     println!("leaf node max cells: {LEAF_NODE_CELL_MAX_NUM}");
+                }
+                ".tree" => {
+                    println!("TREE:");
+                    table.pager.print_tree(0, 0);
                 }
                 _ => println!("ERROR: unknown command: '{input}'"),
             }
