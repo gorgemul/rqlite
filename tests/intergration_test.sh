@@ -297,6 +297,31 @@ $PROMPT "
   assert_and_drop_db "$got" "$expected" "print_tree"
 }
 
+function test_search_in_internal_node() {
+  local commands=()
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 2))); do
+    commands+=("insert $i name$i description$i")
+  done
+  local got=$(exec_command "${commands[@]}")
+  local expected="$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT executed.
+$PROMPT "
+  assert_and_drop_db "$got" "$expected" "search_in_internal_node"
+}
+
 setup
 test_insert_less_args
 test_insert_not_num_id
@@ -311,5 +336,6 @@ test_description_pass_max
 test_persistence
 test_print_constants
 test_print_tree
+test_search_in_internal_node
 summary_test
 teardown
