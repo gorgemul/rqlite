@@ -1,6 +1,8 @@
 PROG="rqlite"
 DB="test.db"
 PROMPT="rqlite>"
+NEW_LINE="
+"
 SUCCESS_TEST_COUNT=0
 FAIL_TEST_COUNT=0
 
@@ -9,13 +11,19 @@ PAGE_MAX_NUMS=64;
 ID_SIZE=8
 NAME_MAX_SIZE=32
 DESCRIPTION_MAX_SIZE=256
-ROW_SIZE=$(($ID_SIZE + $NAME_MAX_SIZE + $DESCRIPTION_MAX_SIZE))
-ROWS_PER_PAGE=$(($PAGE_SIZE / $ROW_SIZE))
-ROW_MAX=$(($PAGE_MAX_NUMS * $ROWS_PER_PAGE))
-NODE_HEADER_SIZE=10
-LEAF_NODE_CELL_SIZE=$(($ROW_SIZE + $ID_SIZE))
-LEAF_NODE_SPACE_FOR_CELLS=$(($PAGE_SIZE - $NODE_HEADER_SIZE))
-LEAF_NODE_CELL_MAX_NUM=$(($LEAF_NODE_SPACE_FOR_CELLS / $LEAF_NODE_CELL_SIZE))
+ROW_SIZE=$((ID_SIZE + NAME_MAX_SIZE + DESCRIPTION_MAX_SIZE))
+NODE_KIND_SIZE=1
+NODE_IS_ROOT_SIZE=1
+NODE_PARENT_SIZE=4
+NODE_N_CELLS_SIZE=4
+NODE_HEADER_SIZE=$((NODE_KIND_SIZE + NODE_IS_ROOT_SIZE + NODE_PARENT_SIZE + NODE_N_CELLS_SIZE))
+LEAF_NODE_NEXT_CELL_SIZE=4
+LEAF_NODE_HEADER_SIZE=$((NODE_HEADER_SIZE + LEAF_NODE_NEXT_CELL_SIZE))
+LEAF_NODE_CELL_SIZE=$((ROW_SIZE + ID_SIZE))
+LEAF_NODE_SPACE_FOR_CELLS=$((PAGE_SIZE - LEAF_NODE_HEADER_SIZE))
+LEAF_NODE_CELL_MAX_NUM=$((LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE))
+SPLIT_RIGHT_LEAF_NODE_NUM=$(((LEAF_NODE_CELL_MAX_NUM + 1) / 2))
+SPLIT_LEFT_LEAF_NODE_NUM=$(((LEAF_NODE_CELL_MAX_NUM + 1) - SPLIT_RIGHT_LEAF_NODE_NUM))
 
 function setup() {
   cargo build || { echo "ERROR: build fail"; exit 1; }
@@ -115,7 +123,7 @@ $PROMPT "
 
 function test_insert_pass_max() {
   local commands=()
-  for i in $(seq 1 $((ROW_MAX + 1))); do
+  for i in $(seq 1 $((2*SPLIT_LEFT_LEAF_NODE_NUM + SPLIT_RIGHT_LEAF_NODE_NUM))); do
     commands+=("insert $i name$i description$i")
   done
   commands+=(".exit")
@@ -126,7 +134,7 @@ function test_insert_pass_max() {
   local result_arr=($result)
   IFS="$save_IFS"
   got="${result_arr[${#result_arr[@]}-2]}" # get second to the last item
-  expected="$PROMPT ERROR: table reach max size."
+  expected="TODO: update parent after split"
   assert_and_drop_db "$got" "$expected" "insert_pass_max"
 }
 
@@ -245,7 +253,7 @@ function test_print_constants() {
   local expected="$PROMPT CONSTANT:
 row size: $ROW_SIZE
 node header size: $NODE_HEADER_SIZE
-leaf node header size: $NODE_HEADER_SIZE
+leaf node header size: $LEAF_NODE_HEADER_SIZE
 leaf node cell size: $LEAF_NODE_CELL_SIZE
 leaf node space for cells: $LEAF_NODE_SPACE_FOR_CELLS
 leaf node max cells: $LEAF_NODE_CELL_MAX_NUM
@@ -259,22 +267,13 @@ function test_print_tree() {
     commands+=("insert $i name$i description$i")
   done
   commands+=(".tree")
+  commands+=(".exit")
   local got=$(exec_command "${commands[@]}")
-  local expected="$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT TREE:
+  local expected=""
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 1))); do
+    expected+="$PROMPT executed.$NEW_LINE"
+  done
+  expected+="$PROMPT TREE:
 - internal (size 1)
   - leaf (size 7)
     - 1
@@ -302,24 +301,36 @@ function test_search_in_internal_node() {
   for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 2))); do
     commands+=("insert $i name$i description$i")
   done
+  commands+=(".exit")
   local got=$(exec_command "${commands[@]}")
-  local expected="$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT executed.
-$PROMPT "
+  local expected=""
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 2))); do
+    # can't do expected+="$PROMPT executed.\n", since bash not interpret \n correctly
+    expected+="$PROMPT executed.$NEW_LINE"
+  done
+  expected+="$PROMPT "
   assert_and_drop_db "$got" "$expected" "search_in_internal_node"
+}
+
+function test_select_all_nodes() {
+  local commands=()
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 1))); do
+    commands+=("insert $i name$i description$i")
+  done
+  commands+=("select")
+  commands+=(".exit")
+  local got=$(exec_command "${commands[@]}")
+  local expected=""
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 1))); do
+    expected+="$PROMPT executed.$NEW_LINE"
+  done
+  expected+="$PROMPT "
+  for i in $(seq 1 $((LEAF_NODE_CELL_MAX_NUM + 1))); do
+    expected+="[$i, name$i, description$i]$NEW_LINE"
+  done
+  expected+="executed.$NEW_LINE"
+  expected+="$PROMPT "
+  assert_and_drop_db "$got" "$expected" "select_all_nodes"
 }
 
 setup
@@ -337,5 +348,6 @@ test_persistence
 test_print_constants
 test_print_tree
 test_search_in_internal_node
+test_select_all_nodes
 summary_test
 teardown
